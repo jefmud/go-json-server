@@ -1,0 +1,55 @@
+{
+  "comments": [
+    {
+      "body": "Nice starter!",
+      "id": 1,
+      "postId": 1
+    }
+  ],
+  "posts": [
+    {
+      "author": "codex",
+      "id": 1,
+      "title": "Welcome to the Go json-server"
+    },
+    {
+      "author": "you",
+      "id": 2,
+      "title": "Build APIs from JSON files"
+    },
+    {
+      "author": "friend",
+      "id": "398e9f8a-1b97-47aa-938c-f77f76733680",
+      "title": "uuid4() is a uniquely generated key"
+    },
+    {
+      "author": "me",
+      "id": 3,
+      "title": "New"
+    },
+    {
+      "author": "me",
+      "id": 4,
+      "title": "Mostly new"
+    },
+    {
+      "author": "me",
+      "id": 5,
+      "title": "Another new post"
+    }
+  ],
+  "profile": [
+    {
+      "id": 1,
+      "name": "json-server"
+    },
+    {
+      "id": 2,
+      "name": "javascript"
+    },
+    {
+      "id": 3,
+      "name": "python"
+    }
+  ]
+}
