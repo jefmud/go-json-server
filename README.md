@@ -1,7 +1,7 @@
 Go JSON Server
 ==============
 
-A minimal Go language JSON database inspired by `typicode/json-server` that serves RESTful CRUD endpoints
+A minimal Go language JSON database inspired by `typicode/json-server` (https://github.com/typicode/json-server) that serves RESTful CRUD endpoints
 backed by JSON files on disk. Each API is mounted at `/api/<json>`,
 where `<json>` is the base name of a JSON file located in `./json`.
 
