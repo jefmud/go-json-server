@@ -17,7 +17,7 @@ from typing import Any, Dict, List
 from client import JsonServerClient, JsonServerError
 
 DEFAULT_URL = os.getenv("JSON_SERVER_URL", "http://localhost:11220")
-DEFAULT_TOKEN = os.getenv("API_TOKEN", "secret-token")
+DEFAULT_TOKEN = os.getenv("JSON_SERVER_API_TOKEN", "secret-token")
 DEFAULT_DB = os.getenv("JSON_SERVER_DB", "mybase")
 
 
