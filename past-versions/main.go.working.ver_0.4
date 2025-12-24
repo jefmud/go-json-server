@@ -1,0 +1,720 @@
+package main
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"math"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+type server struct {
+	jsonDir string
+	token   string
+	dbs     sync.Map // map[string]*database
+	logger  *log.Logger
+}
+
+type loggingResponseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (lrw *loggingResponseWriter) WriteHeader(code int) {
+	lrw.status = code
+	lrw.ResponseWriter.WriteHeader(code)
+}
+
+type database struct {
+	name string
+	path string
+
+	mu   sync.RWMutex
+	data map[string]interface{}
+}
+
+func main() {
+	host := flag.String("host", "0.0.0.0", "Host/IP to bind (use 0.0.0.0 for all interfaces)")
+	port := flag.Int("port", 8080, "Port to listen on")
+	token := flag.String("token", os.Getenv("API_TOKEN"), "Bearer token required in the Authorization header (also via API_TOKEN)")
+	jsonDir := flag.String("json-dir", "json", "Directory containing JSON files")
+	verbose := flag.Bool("verbose", false, "Enable request logging to stdout")
+	logFile := flag.String("log-file", "", "Optional path to write request logs")
+	flag.Parse()
+
+	if *token == "" {
+		log.Fatal("API token is required (set -token or API_TOKEN)")
+	}
+
+	var logOutputs []io.Writer
+	if *verbose {
+		logOutputs = append(logOutputs, os.Stdout)
+	}
+	if *logFile != "" {
+		f, err := os.OpenFile(*logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			log.Fatalf("open log file: %v", err)
+		}
+		logOutputs = append(logOutputs, f)
+	}
+
+	var requestLogger *log.Logger
+	if len(logOutputs) > 0 {
+		requestLogger = log.New(io.MultiWriter(logOutputs...), "", log.LstdFlags)
+	}
+
+	s := &server{
+		jsonDir: *jsonDir,
+		token:   *token,
+		logger:  requestLogger,
+	}
+
+	addr := fmt.Sprintf("%s:%d", *host, *port)
+	log.Printf("Starting json-server work-alike on %s using %s", addr, *jsonDir)
+	if err := http.ListenAndServe(addr, s); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	lrw := &loggingResponseWriter{ResponseWriter: w, status: http.StatusOK}
+	s.serve(lrw, r)
+	if s.logger != nil {
+		ip := clientIP(r)
+		s.logger.Printf("%s %s %s %d %s", ip, r.Method, r.URL.Path, lrw.status, time.Since(start).Round(time.Millisecond))
+	}
+}
+
+func (s *server) serve(w http.ResponseWriter, r *http.Request) {
+	if !s.authorized(r) {
+		writeError(w, http.StatusUnauthorized, "missing or invalid Authorization header")
+		return
+	}
+
+	parts := splitPath(r.URL.Path)
+	if len(parts) < 2 || parts[0] != "api" {
+		http.NotFound(w, r)
+		return
+	}
+
+	dbName := strings.TrimSuffix(parts[1], ".json")
+	if !isSafeName(dbName) {
+		writeError(w, http.StatusBadRequest, "invalid database name")
+		return
+	}
+
+	allowCreate := r.Method == http.MethodPost ||
+		r.Method == http.MethodPut ||
+		r.Method == http.MethodPatch ||
+		r.Method == http.MethodDelete
+	db, err := s.loadDatabase(dbName, allowCreate)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			writeError(w, http.StatusNotFound, "json file not found")
+			return
+		}
+		log.Printf("load %s: %v", dbName, err)
+		writeError(w, http.StatusInternalServerError, "failed to load database")
+		return
+	}
+
+	switch len(parts) {
+	case 2:
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, "only GET is allowed on the database root")
+			return
+		}
+		payload := db.snapshot()
+		writeJSON(w, http.StatusOK, payload)
+	case 3:
+		s.handleCollection(w, r, db, parts[2])
+	case 4:
+		s.handleResource(w, r, db, parts[2], parts[3])
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func (s *server) authorized(r *http.Request) bool {
+	h := r.Header.Get("Authorization")
+	prefix := "Bearer "
+	if !strings.HasPrefix(h, prefix) {
+		return false
+	}
+	token := strings.TrimPrefix(h, prefix)
+	return token == s.token
+}
+
+func (s *server) handleCollection(w http.ResponseWriter, r *http.Request, db *database, collection string) {
+	switch r.Method {
+	case http.MethodGet:
+		items, err := db.getCollection(collection, r.URL.Query())
+		if err != nil {
+			writeError(w, statusFromError(err), err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, items)
+	case http.MethodPost:
+		created, err := db.createItem(collection, r)
+		if err != nil {
+			writeError(w, statusFromError(err), err.Error())
+			return
+		}
+		writeJSON(w, http.StatusCreated, created)
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "unsupported method")
+	}
+}
+
+func (s *server) handleResource(w http.ResponseWriter, r *http.Request, db *database, collection, id string) {
+	switch r.Method {
+	case http.MethodGet:
+		item, err := db.getItem(collection, id)
+		if err != nil {
+			writeError(w, statusFromError(err), err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, item)
+	case http.MethodPut:
+		item, err := db.replaceItem(collection, id, r)
+		if err != nil {
+			writeError(w, statusFromError(err), err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, item)
+	case http.MethodPatch:
+		item, err := db.patchItem(collection, id, r)
+		if err != nil {
+			writeError(w, statusFromError(err), err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, item)
+	case http.MethodDelete:
+		if err := db.deleteItem(collection, id); err != nil {
+			writeError(w, statusFromError(err), err.Error())
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "unsupported method")
+	}
+}
+
+func (s *server) loadDatabase(name string, create bool) (*database, error) {
+	if db, ok := s.dbs.Load(name); ok {
+		return db.(*database), nil
+	}
+
+	path := filepath.Join(s.jsonDir, name+".json")
+	db := &database{
+		name: name,
+		path: path,
+		data: map[string]interface{}{},
+	}
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		if !create {
+			return nil, err
+		}
+		// Immediately persist an empty object so the DB is visible on disk.
+		if err := db.save(); err != nil {
+			return nil, fmt.Errorf("create %s: %w", name, err)
+		}
+	} else if err != nil {
+		return nil, err
+	} else if err := db.load(); err != nil {
+		return nil, err
+	}
+	actual, loaded := s.dbs.LoadOrStore(name, db)
+	if loaded {
+		return actual.(*database), nil
+	}
+	return db, nil
+}
+
+func (db *database) load() error {
+	raw, err := os.ReadFile(db.path)
+	if err != nil {
+		return err
+	}
+	var data map[string]interface{}
+	if err := json.Unmarshal(raw, &data); err != nil {
+		return fmt.Errorf("parse %s: %w", db.path, err)
+	}
+	db.mu.Lock()
+	db.data = data
+	db.mu.Unlock()
+	return nil
+}
+
+func (db *database) snapshot() map[string]interface{} {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	clone := make(map[string]interface{}, len(db.data))
+	for k, v := range db.data {
+		clone[k] = v
+	}
+	return clone
+}
+
+func (db *database) getCollection(name string, q url.Values) ([]interface{}, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	raw, ok := db.data[name]
+	if !ok {
+		return nil, fmt.Errorf("collection %s not found", name)
+	}
+	list, ok := raw.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("collection %s is not an array", name)
+	}
+
+	filtered := filterItems(list, q)
+	return filtered, nil
+}
+
+func (db *database) createItem(collection string, r *http.Request) (map[string]interface{}, error) {
+	var body map[string]interface{}
+	if err := decodeBody(r, &body); err != nil {
+		return nil, err
+	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	raw, ok := db.data[collection]
+	if !ok {
+		raw = []interface{}{}
+	}
+
+	list, ok := raw.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("collection %s is not an array", collection)
+	}
+
+	if _, ok := body["id"]; !ok {
+		body["id"] = nextID(list)
+	}
+
+	list = append(list, body)
+	db.data[collection] = list
+	if err := db.save(); err != nil {
+		return nil, fmt.Errorf("failed to persist %s: %w", db.name, err)
+	}
+	return body, nil
+}
+
+func (db *database) getItem(collection, id string) (map[string]interface{}, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	list, err := db.collectionSlice(collection)
+	if err != nil {
+		return nil, err
+	}
+	_, obj := findByID(list, id)
+	if obj == nil {
+		return nil, fmt.Errorf("item %s not found in %s", id, collection)
+	}
+	return obj, nil
+}
+
+func (db *database) replaceItem(collection, id string, r *http.Request) (map[string]interface{}, error) {
+	var body map[string]interface{}
+	if err := decodeBody(r, &body); err != nil {
+		return nil, err
+	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	list, err := db.collectionSlice(collection)
+	if err != nil {
+		return nil, err
+	}
+	idx, obj := findByID(list, id)
+	if obj == nil {
+		return nil, fmt.Errorf("item %s not found in %s", id, collection)
+	}
+
+	body["id"] = obj["id"]
+	list[idx] = body
+	db.data[collection] = list
+	if err := db.save(); err != nil {
+		return nil, fmt.Errorf("failed to persist %s: %w", db.name, err)
+	}
+	return body, nil
+}
+
+func (db *database) patchItem(collection, id string, r *http.Request) (map[string]interface{}, error) {
+	var body map[string]interface{}
+	if err := decodeBody(r, &body); err != nil {
+		return nil, err
+	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	list, err := db.collectionSlice(collection)
+	if err != nil {
+		return nil, err
+	}
+	idx, obj := findByID(list, id)
+	if obj == nil {
+		return nil, fmt.Errorf("item %s not found in %s", id, collection)
+	}
+
+	for k, v := range body {
+		if k == "id" {
+			continue
+		}
+		obj[k] = v
+	}
+	list[idx] = obj
+	db.data[collection] = list
+	if err := db.save(); err != nil {
+		return nil, fmt.Errorf("failed to persist %s: %w", db.name, err)
+	}
+	return obj, nil
+}
+
+func (db *database) deleteItem(collection, id string) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	list, err := db.collectionSlice(collection)
+	if err != nil {
+		return err
+	}
+	idx, obj := findByID(list, id)
+	if obj == nil {
+		return fmt.Errorf("item %s not found in %s", id, collection)
+	}
+
+	list = append(list[:idx], list[idx+1:]...)
+	db.data[collection] = list
+	return db.save()
+}
+
+func (db *database) collectionSlice(name string) ([]interface{}, error) {
+	raw, ok := db.data[name]
+	if !ok {
+		return nil, fmt.Errorf("collection %s not found", name)
+	}
+	list, ok := raw.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("collection %s is not an array", name)
+	}
+	return list, nil
+}
+
+func (db *database) save() error {
+	buf, err := json.MarshalIndent(db.data, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(db.path, buf, 0644)
+}
+
+func decodeBody(r *http.Request, dest interface{}) error {
+	defer r.Body.Close()
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dest); err != nil {
+		return fmt.Errorf("invalid json body: %w", err)
+	}
+	return nil
+}
+
+func filterItems(items []interface{}, q url.Values) []interface{} {
+	filtered := make([]interface{}, 0, len(items))
+	for _, raw := range items {
+		obj, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if matchQuery(obj, q) {
+			filtered = append(filtered, obj)
+		}
+	}
+
+	sortField := q.Get("_sort")
+	if sortField != "" {
+		desc := strings.EqualFold(q.Get("_order"), "desc")
+		sort.SliceStable(filtered, func(i, j int) bool {
+			left := filtered[i].(map[string]interface{})
+			right := filtered[j].(map[string]interface{})
+			lv, _ := nestedValue(left, sortField)
+			rv, _ := nestedValue(right, sortField)
+			return compareValues(lv, rv, desc)
+		})
+	}
+
+	limit, _ := strconv.Atoi(q.Get("_limit"))
+	page, _ := strconv.Atoi(q.Get("_page"))
+	if limit > 0 {
+		if page < 1 {
+			page = 1
+		}
+		start := (page - 1) * limit
+		if start >= len(filtered) {
+			return []interface{}{}
+		}
+		end := start + limit
+		if end > len(filtered) {
+			end = len(filtered)
+		}
+		return filtered[start:end]
+	}
+
+	return filtered
+}
+
+func matchQuery(obj map[string]interface{}, q url.Values) bool {
+	for key, vals := range q {
+		if strings.HasPrefix(key, "_") {
+			continue
+		}
+		if len(vals) == 0 {
+			continue
+		}
+		needle := vals[len(vals)-1]
+		value, ok := nestedValue(obj, key)
+		if !ok {
+			return false
+		}
+		hay := normalize(value)
+		if strings.ContainsAny(needle, "*?") {
+			if !wildcardMatch(hay, needle) {
+				return false
+			}
+			continue
+		}
+		if hay != needle {
+			return false
+		}
+	}
+	return true
+}
+
+// nestedValue walks dot-separated keys (e.g., "author.name") inside a map.
+func nestedValue(obj map[string]interface{}, path string) (interface{}, bool) {
+	if obj == nil {
+		return nil, false
+	}
+	parts := strings.Split(path, ".")
+	var cur interface{} = obj
+	for i, part := range parts {
+		m, ok := cur.(map[string]interface{})
+		if !ok {
+			return nil, false
+		}
+		val, ok := m[part]
+		if !ok {
+			return nil, false
+		}
+		if i == len(parts)-1 {
+			return val, true
+		}
+		cur = val
+	}
+	return nil, false
+}
+
+func wildcardMatch(haystack, pattern string) bool {
+	rePattern := "^" + globToRegex(pattern) + "$"
+	re, err := regexp.Compile(rePattern)
+	if err != nil {
+		return false
+	}
+	return re.MatchString(haystack)
+}
+
+func globToRegex(pattern string) string {
+	escaped := regexp.QuoteMeta(pattern)
+	escaped = strings.ReplaceAll(escaped, "\\*", ".*")
+	escaped = strings.ReplaceAll(escaped, "\\?", ".")
+	return escaped
+}
+
+func compareValues(a, b interface{}, desc bool) bool {
+	aNum, aIsNum := toFloat(a)
+	bNum, bIsNum := toFloat(b)
+
+	var less bool
+	switch {
+	case aIsNum && bIsNum:
+		less = aNum < bNum
+	default:
+		less = normalize(a) < normalize(b)
+	}
+
+	if desc {
+		return !less
+	}
+	return less
+}
+
+func findByID(list []interface{}, id string) (int, map[string]interface{}) {
+	for idx, raw := range list {
+		obj, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if normalize(obj["id"]) == id {
+			return idx, obj
+		}
+	}
+	return -1, nil
+}
+
+func nextID(list []interface{}) interface{} {
+	var max float64
+	hasNum := false
+	for _, raw := range list {
+		obj, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		val, ok := toFloat(obj["id"])
+		if ok {
+			if !hasNum || val > max {
+				max = val
+			}
+			hasNum = true
+		}
+	}
+	if hasNum {
+		return math.Floor(max) + 1
+	}
+	return newUUID()
+}
+
+func newUUID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+
+	// Set version (4) and variant bits per RFC 4122.
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+
+	hexed := hex.EncodeToString(b[:])
+	return fmt.Sprintf("%s-%s-%s-%s-%s",
+		hexed[0:8],
+		hexed[8:12],
+		hexed[12:16],
+		hexed[16:20],
+		hexed[20:32])
+}
+
+func toFloat(v interface{}) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case float32:
+		return float64(n), true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case json.Number:
+		f, err := n.Float64()
+		if err == nil {
+			return f, true
+		}
+	case string:
+		f, err := strconv.ParseFloat(n, 64)
+		if err == nil {
+			return f, true
+		}
+	}
+	return 0, false
+}
+
+func normalize(v interface{}) string {
+	switch x := v.(type) {
+	case string:
+		return x
+	case float64:
+		if x == math.Trunc(x) {
+			return strconv.FormatInt(int64(x), 10)
+		}
+		return strconv.FormatFloat(x, 'f', -1, 64)
+	case float32:
+		if x == float32(math.Trunc(float64(x))) {
+			return strconv.FormatInt(int64(x), 10)
+		}
+		return strconv.FormatFloat(float64(x), 'f', -1, 64)
+	case int, int64, int32:
+		return fmt.Sprintf("%d", x)
+	default:
+		return fmt.Sprintf("%v", x)
+	}
+}
+
+func statusFromError(err error) int {
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "not found"):
+		return http.StatusNotFound
+	case strings.Contains(msg, "invalid"):
+		return http.StatusBadRequest
+	case strings.Contains(msg, "not an array"):
+		return http.StatusBadRequest
+	default:
+		return http.StatusBadRequest
+	}
+}
+
+func splitPath(p string) []string {
+	trimmed := strings.Trim(p, "/")
+	if trimmed == "" {
+		return nil
+	}
+	return strings.Split(trimmed, "/")
+}
+
+func isSafeName(name string) bool {
+	if name == "" {
+		return false
+	}
+	return !strings.ContainsAny(name, `/\`)
+}
+
+func writeJSON(w http.ResponseWriter, status int, payload interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(payload)
+}
+
+func writeError(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
