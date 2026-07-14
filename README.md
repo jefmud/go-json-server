@@ -5,7 +5,7 @@ A minimal Go language JSON database inspired by `typicode/json-server` (https://
 backed by JSON files on disk. Each API is mounted at `/api/<json>`,
 where `<json>` is the base name of a JSON file located in `./json`.
 
-Disclaimer: This server is intended to be used in lightweight projects and definitely not for production
+Disclaimer: This server is intended to be used in LOCAL development only lightweight projects and definitely not for production
 where security and speed are important!
 
 Features
